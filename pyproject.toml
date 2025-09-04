@@ -38,6 +38,9 @@ jax-cpu = [
 jax-cuda = [
   "jax[cuda]",
 ]
+jax-tpu= [
+  "jax[tpu]",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -66,6 +69,7 @@ conflicts = [
     [
       { group = "jax-cpu" },
       { group = "jax-cuda" },
+      { group = "jax-tpu" },
     ],
 ]
 package = true
