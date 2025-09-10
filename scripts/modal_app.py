@@ -17,7 +17,6 @@ image = (
         "BOLTZ_CACHE": "/root/.boltz",
         "JAX_PLATFORMS": "cuda"
     })
-    .secret(modal.Secret.from_name("github-token"))
     .run_commands(
         "python -m pip install -U pip setuptools wheel && "
         # CUDA PyTorch for GPU (pulls CUDA runtime libs)
@@ -27,14 +26,10 @@ image = (
         "python -m pip install --upgrade jax-cuda12-plugin==0.6.2 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html && "
         # PTX toolchain
         "python -m pip install nvidia-cuda-nvcc-cu12==12.8.93 && "
-        # Clone private repo with GitHub token provided by Modal Secret
-        "git clone https://x-access-token:${GITHUB_TOKEN}@github.com/adaptyvbio/mosaic_workflows.git /opt/mosaic_workflows && "
-        # Git-only deps
+        # Git-only deps needed at runtime
         "python -m pip install git+https://github.com/escalante-bio/jablang.git && "
         "python -m pip install git+https://github.com/escalante-bio/esmj.git && "
-        "python -m pip install git+https://github.com/escalante-bio/protenij.git && "
-        # Install local packages from the cloned mono-repo
-        "python -m pip install -e /opt/mosaic_workflows/src/mosaic -e /opt/mosaic_workflows/src/mosaic_workflows -e /opt/mosaic_workflows/src/binder_games -e /opt/mosaic_workflows/src/joltz"
+        "python -m pip install git+https://github.com/escalante-bio/protenij.git"
     )
 )
 
@@ -62,7 +57,7 @@ def _default_steps(total: int = 20) -> Dict[str, int]:
     return {"warmup": w, "soft": s, "anneal": a}
 
 
-@app.function(gpu="A10G", timeout=3 * 60 * 60, volumes={"/root/.boltz": boltz_cache, "/results": results_vol})
+@app.function(gpu="A10G", timeout=3 * 60 * 60, volumes={"/root/.boltz": boltz_cache, "/results": results_vol}, secrets=[modal.Secret.from_name("github-token")])
 def run_mhetase(
     *,
     binder_len: int = 20,
@@ -102,7 +97,18 @@ def run_mhetase(
     except Exception as e:
         raise RuntimeError(f"GPU preflight failed: {e}")
 
-    workspace = Path("/opt/mosaic_workflows").resolve()
+    # Clone repo at runtime (avoid uploading local code); use secret GITHUB_TOKEN if available
+    repo_dir = Path("/repo").resolve()
+    try:
+        if not repo_dir.exists() or not any(repo_dir.iterdir()):
+            import subprocess
+            token = os.environ.get("GITHUB_TOKEN", "")
+            url = "https://github.com/adaptyvbio/mosaic_workflows.git" if not token else f"https://x-access-token:{token}@github.com/adaptyvbio/mosaic_workflows.git"
+            subprocess.run(["git", "clone", "--depth", "1", url, str(repo_dir)], check=True)
+    except Exception:
+        pass
+
+    workspace = repo_dir
     _add_paths(workspace)
 
     from mosaic_workflows import run_workflow

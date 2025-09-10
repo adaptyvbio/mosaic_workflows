@@ -176,6 +176,31 @@ best_seq = out["best_sequence"]
 # Optionally: rebuild features with best_seq and run predictor for pLDDT/PAE/etc
 ```
 
+Data flow (single-player)
+-------------------------
+```
+[Problem spec]
+    ↓
+[Feature builder (mosaic.losses.*): binder_len, target_sequence, templates, MSA]
+    ↓
+[Loss (mosaic): LinearCombination of LossTerm(s) incl. predictors]
+    ↓                     ↑
+  (value, aux)           │
+    ↓                    │
+[Optimizer step (mosaic_workflows)]
+  ├─ schedule(g,p) -> knobs (e.g., lr, temperature, e_soft)
+  ├─ transforms: pre_logits / pre_probs / grad / post_logits
+  └─ update_loss_state (optional)
+    ↓
+[Trajectory record] ← analyzers(aux) → metrics
+    ↓
+[best_x logits] → argmax per position → [best_sequence]
+    ↓
+[Optional prediction/relax/filters using best_sequence]
+```
+
+Note: In two-player games, losses and transforms operate per player (x/y) with analogous flows; analyzers may report saddle-gap and per-player values.
+
 #### mosaic_workflows (orchestration)
 
 - Express runs as `workflow` dicts with sequential `phases`.
