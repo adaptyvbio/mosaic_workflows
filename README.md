@@ -1,6 +1,228 @@
 
 
-## Functional, multi-objective protein design using continuous relaxation.
+## Overview
+
+This repository contains three tightly coupled components for functional, multi-objective protein design:
+
+- `mosaic`: A loss-first composition library to define design objectives by combining predictor-backed `LossTerm`s and classic priors.
+- `mosaic_workflows`: A minimal orchestration layer that expresses a design run as sequential `phases` with optimizers, schedules, and step-time transforms.
+- `binder_games`: Game-theoretic optimizers (min–max, Stackelberg, extragradient, multi-adversary) for robust binder design, reusing the workflow interface with per-player transforms.
+
+Use `mosaic` to define what to optimize, `mosaic_workflows` to control how to optimize it, and `binder_games` when modeling an adversary or robustness objective.
+
+---
+
+### Quickstart
+
+Single-player (Boltz1 control):
+
+```python
+import numpy as np
+import mosaic.losses.structure_prediction as sp
+from mosaic.losses.boltz import load_boltz, make_binder_features, Boltz1Loss
+from mosaic_workflows import run_workflow, adamw_logits, sgd_logits, init_logits_boltzdesign1
+from mosaic_workflows.transforms import temperature_on_logits, e_soft_on_logits, gradient_normalizer, zero_disallowed
+
+seed, binder_len = 42, 20
+boltz1 = load_boltz()
+features, _ = make_binder_features(binder_len=binder_len, target_sequence="MFEARLVQGSI", use_msa=False, use_msa_server=False)
+
+def build_loss():
+    terms = (
+        1.0 * sp.BinderTargetContact(contact_distance=21.0)
+        + 1.0 * sp.WithinBinderContact(max_contact_distance=14.0, num_contacts_per_residue=4, min_sequence_separation=8)
+        + (-0.3) * sp.HelixLoss()
+    )
+    return Boltz1Loss(joltz1=boltz1, name="boltz1", loss=terms, features=features, recycling_steps=0, deterministic=True)
+
+warmup = {
+    "name": "warmup",
+    "build_loss": build_loss,
+    "optimizer": adamw_logits,
+    "steps": 10,
+    "schedule": lambda g,p: {"learning_rate": 0.2, "temperature": 1.0, "e_soft": 0.8},
+    "transforms": {
+        "pre_logits": [temperature_on_logits(), e_soft_on_logits()],
+        "grad": [gradient_normalizer(mode="per_chain", log_norm=True), zero_disallowed(restrict_to_canon=True, avoid_residues=["CYS"])],
+    },
+}
+
+anneal = {
+    "name": "anneal",
+    "build_loss": build_loss,
+    "optimizer": sgd_logits,
+    "steps": 50,
+    "schedule": lambda g,p: {"lr": 0.1, "temperature": max(0.01, 1.0 - (p/50.0)**2)},
+    "transforms": {"pre_logits": [temperature_on_logits()]},
+}
+
+x0 = init_logits_boltzdesign1(binder_len=binder_len, noise_scaling=0.1, rng=np.random.default_rng(seed))
+wf = {"phases": [warmup, anneal], "binder_len": binder_len, "seed": seed, "initial_x": x0}
+out = run_workflow(wf)
+print("Best sequence:", out["best_sequence"])  # argmax decode of best logits
+```
+
+Two-player min–max (Boltz1 vs Boltz1):
+
+```python
+import numpy as np
+import mosaic.losses.structure_prediction as sp
+from mosaic.losses.boltz import load_boltz, make_binder_features, Boltz1Loss
+from mosaic_workflows import run_workflow, init_logits_boltzdesign1
+from mosaic_workflows.transforms import temperature_on_logits, e_soft_on_logits, gradient_normalizer, zero_disallowed
+from binder_games import build_minmax_phase, make_minmax_loss
+from binder_games.analyzers import saddle_gap_estimate, decode_sequences_xy
+
+seed, binder_len = 42, 20
+boltz1 = load_boltz()
+features, _ = make_binder_features(binder_len=binder_len, target_sequence="MFEARLVQGSI", use_msa=False, use_msa_server=False)
+
+def two_arg_loss():
+    base = (
+        1.0 * sp.BinderTargetContact(contact_distance=21.0)
+        + 1.0 * sp.WithinBinderContact(max_contact_distance=14.0, num_contacts_per_residue=4, min_sequence_separation=8)
+        + (-0.3) * sp.HelixLoss()
+    )
+    loss_x = Boltz1Loss(joltz1=boltz1, name="x", loss=base, features=features, recycling_steps=0, deterministic=True)
+    loss_y = Boltz1Loss(joltz1=boltz1, name="y", loss=base, features=features, recycling_steps=0, deterministic=True)
+    return make_minmax_loss(loss_x, loss_y)
+
+phase = build_minmax_phase(
+    name="minmax_boltz1",
+    build_loss=two_arg_loss,
+    steps=120,
+    schedule=lambda g,p: {"lr_x": 0.05, "lr_y": 0.05, "temperature": 1.0},
+    transforms={
+        "x": {"pre_logits": [temperature_on_logits(), e_soft_on_logits()], "grad": [gradient_normalizer(mode="per_chain", log_norm=True), zero_disallowed(restrict_to_canon=True, avoid_residues=["CYS"])]},
+        "y": {"pre_logits": [temperature_on_logits(), e_soft_on_logits()], "grad": [gradient_normalizer(mode="per_chain", log_norm=True), zero_disallowed(restrict_to_canon=True, avoid_residues=["CYS"])]},
+    },
+    analyzers=[saddle_gap_estimate(), decode_sequences_xy()],
+    analyze_every=10,
+)
+
+x0 = init_logits_boltzdesign1(binder_len=binder_len, noise_scaling=0.1, rng=np.random.default_rng(seed))
+out = run_workflow({"phases": [phase], "binder_len": binder_len, "seed": seed, "initial_x": x0})
+print("Best sequence (x):", out.get("best_sequence"))
+```
+
+See also: `scripts/run_pdl1_boltzdesign_control.py`, `scripts/run_binder_games_boltz1_minmax.py`.
+
+---
+
+### Components
+
+#### mosaic (objectives)
+
+- Compose `LossTerm`s: structure prediction (`sp.*`), Boltz/AF2/Protenix wrappers, ESM/ESMC PLL, ProteinMPNN losses, stability, AbLang, trigram.
+- Use loss-internal transformations to shape the objective: `ClippedLoss`, `ClippedGradient`, `NormedGradient`, `FixedPositionsPenalty`, `SetPositions`, etc.
+
+```python
+import mosaic.losses.structure_prediction as sp
+from mosaic.losses.boltz import load_boltz, make_binder_features, Boltz1Loss
+from mosaic.losses.transformations import ClippedLoss, FixedPositionsPenalty
+
+boltz1 = load_boltz()
+features, _ = make_binder_features(binder_len=50, target_sequence="GGGG", use_msa=False, use_msa_server=False)
+
+base = 2.0 * sp.BinderTargetContact(contact_distance=20.0) + 1.0 * sp.WithinBinderContact(max_contact_distance=14.0, num_contacts_per_residue=2, min_sequence_separation=8) + 0.3 * sp.HelixLoss()
+mask_penalty = FixedPositionsPenalty(positions=[0, 5, 9], penalty=2.0)
+loss = Boltz1Loss(joltz1=boltz1, name="target", loss=ClippedLoss(base + mask_penalty, lo=-10.0, hi=10.0), features=features, recycling_steps=0, deterministic=True)
+```
+
+More: model-specific details remain below in this file (AF2, Protenix, ESM, MPNN, Stability, AbLang, Trigram).
+
+Design patterns & integration with workflows
+-------------------------------------------
+- Loss builder closure: build a zero-arg `build_loss()` that captures heavyweight artifacts (e.g., `joltz`, `features`) once, then return a ready `LossTerm` for each phase.
+
+```python
+boltz1 = load_boltz()
+features, _ = make_binder_features(binder_len=N, target_sequence=target_seq, use_msa=False, use_msa_server=False)
+
+def build_loss():
+  terms = 1.0 * sp.BinderTargetContact(contact_distance=21.0) + 0.3 * sp.HelixLoss()
+  return Boltz1Loss(joltz1=boltz1, name="boltz1", loss=terms, features=features, recycling_steps=0, deterministic=True)
+```
+
+- Separation of concerns: put schedule-driven behavior in workflow transforms (e.g., `temperature_on_logits`, `gradient_normalizer`) and keep semantic constraints in mosaic loss-internal transformations (`FixedPositionsPenalty`, `ClippedLoss`).
+
+```python
+# In workflow phase
+phase = {
+  "schedule": lambda g,p: {"temperature": max(0.01, 1.0 - (p/100.0)**2)},
+  "transforms": {"pre_logits": [temperature_on_logits()]},
+}
+
+# In build_loss (semantic objective)
+loss = ClippedLoss(sp.BinderTargetContact(contact_distance=20.0) + 0.3 * sp.HelixLoss(), lo=-10.0, hi=10.0)
+```
+
+- Aux and analyzers: mosaic losses return `(value, aux)`; analyzers in `mosaic_workflows` can read `aux` and report metrics to the trajectory (safe by default).
+
+```python
+from mosaic_workflows.analyzers import flatten_aux  # example utility if present
+
+def report_contacts(aux):
+  return {"bt_contacts": float(aux.get("BinderTargetContact/value", 0.0))}
+
+phase = {"analyzers": [report_contacts], "analyze_every": 10}
+```
+
+- Best sequence and prediction: `run_workflow` decodes `best_x` by argmax to `best_sequence`. Use the same build features + predictor to run a final prediction for reporting or filtering.
+
+```python
+out = run_workflow(workflow)
+best_seq = out["best_sequence"]
+# Optionally: rebuild features with best_seq and run predictor for pLDDT/PAE/etc
+```
+
+#### mosaic_workflows (orchestration)
+
+- Express runs as `workflow` dicts with sequential `phases`.
+- Step-time transforms alter optimization dynamics: `pre_logits`, `pre_probs`, `grad`, `post_logits`, `post_probs`.
+- Shared optimizer signature and schedule interface; stateful-loss updates via `update_loss_state=True`.
+
+```python
+from mosaic_workflows import run_workflow, adamw_logits
+from mosaic_workflows.transforms import temperature_on_logits, gradient_normalizer
+
+phase = {
+  "name": "warmup",
+  "build_loss": build_loss,
+  "optimizer": adamw_logits,
+  "steps": 30,
+  "schedule": lambda g,p: {"learning_rate": 0.1, "temperature": 1.0},
+  "transforms": {
+    "pre_logits": [temperature_on_logits()],
+    "grad": [gradient_normalizer(mode="per_chain", log_norm=True)],
+  },
+}
+wf = {"phases": [phase], "binder_len": 60, "seed": 7, "initial_x": x0}
+out = run_workflow(wf)
+```
+
+Reference: `src/mosaic_workflows/README.md` (deeper coverage: transforms vs loss-internal, analyzers, callbacks, stateful losses).
+
+#### binder_games (two-player)
+
+- Build two-argument losses and game phases (min–max, Stackelberg, extragradient, multi-adversary).
+- Per-player schedules/transforms and analyzers (e.g., saddle gap).
+
+```python
+from binder_games import build_minmax_phase, make_minmax_loss
+phase = build_minmax_phase(
+  name="minmax",
+  build_loss=two_arg_loss,  # returns (x_probs, y_probs, key) -> (value, aux)
+  steps=150,
+  schedule=lambda g,p: {"lr_x":0.1, "lr_y":0.1, "temperature":1.0},
+  transforms={"x": {...}, "y": {...}},
+)
+```
+
+Reference: `src/binder_games/README.md`.
+
+---
+## Mosaic: Functional, multi-objective protein design using continuous relaxation
 
 
  Protein design tasks almost always involve multiple constraints or properies that must be satisfied or optimized. For instance, in binder design one may want to simultaneously ensure:
@@ -14,15 +236,15 @@ There has been a recent explosion in the application of machine learning to prot
 ---
 
 ### Installation
-We recommend using `uv`, e.g. run `uv sync --group jax-cuda` after cloning the repo to install dependencies.
+We recommend using `uv`:
+```
+uv sync --group jax-cuda
+source .venv/bin/activate
+```
 
-To run the example notebook try `source .venv/bin/activate`, `marimo edit examples/example_notebook.py`.
-
-> You may need to add various `uv` overrides for specific packages and your machine, take a look at [pyproject.toml](pyproject.toml)
-
-> You'll need a GPU or TPU-compatible version of JAX for structure prediction. You might need to install this manually, i.e. ` uv add jax[cuda12].`
-
-To automatically download the AF2 weights you'll need to install `aria2`: `apt-get install aria2`.
+- You may need to add `uv` overrides for specific packages and your platform; see `pyproject.toml`.
+- Install a GPU/TPU-compatible JAX build as needed (e.g., `uv add jax[cuda12]`).
+- To auto-download AF2 weights, install `aria2` (e.g., `apt-get install aria2`).
 
 ### Introduction
 
@@ -33,7 +255,7 @@ This project combines two simple components to make a powerful protein design fr
 
 The key observation is that it's possible to use this continuous relaxation simultaneously with multiple learned objective terms [^1]. 
 
-This allows us to easily construct objective functions that are combinations of multiple learned potentials and optimize them efficiently, like so:
+This allows us to easily construct objective functions that are combinations of multiple learned potentials and optimize them efficiently, like so (see also the new sections on `mosaic_workflows` and `binder_games` below):
 
 ```python
 combined_loss = (

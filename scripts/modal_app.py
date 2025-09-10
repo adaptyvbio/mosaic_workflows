@@ -11,14 +11,13 @@ import modal
 # Base image with Python + common scientific stack; adjust as needed.
 # For GPU runs, set gpu=modal.gpu.A10G() on the function below and add CUDA wheels.
 image = (
-    modal.Image.debian_slim()
+    modal.Image.debian_slim(python_version="3.12")
     .apt_install("git")
     .env({
         "BOLTZ_CACHE": "/root/.boltz",
         "JAX_PLATFORMS": "cuda"
     })
-    # Include the whole repo so we can install from the root pyproject.toml
-    .add_local_dir(Path.cwd(), "/workspace", copy=True)
+    .secret(modal.Secret.from_name("github-token"))
     .run_commands(
         "python -m pip install -U pip setuptools wheel && "
         # CUDA PyTorch for GPU (pulls CUDA runtime libs)
@@ -28,11 +27,14 @@ image = (
         "python -m pip install --upgrade jax-cuda12-plugin==0.6.2 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html && "
         # PTX toolchain
         "python -m pip install nvidia-cuda-nvcc-cu12==12.8.93 && "
-        # Git deps
+        # Clone private repo with GitHub token provided by Modal Secret
+        "git clone https://x-access-token:${GITHUB_TOKEN}@github.com/adaptyvbio/mosaic_workflows.git /opt/mosaic_workflows && "
+        # Git-only deps
         "python -m pip install git+https://github.com/escalante-bio/jablang.git && "
         "python -m pip install git+https://github.com/escalante-bio/esmj.git && "
-        # Install all local packages from the root pyproject (editable, no deps)
-        "python -m pip install -e /workspace --no-deps"
+        "python -m pip install git+https://github.com/escalante-bio/protenij.git && "
+        # Install local packages from the cloned mono-repo
+        "python -m pip install -e /opt/mosaic_workflows/src/mosaic -e /opt/mosaic_workflows/src/mosaic_workflows -e /opt/mosaic_workflows/src/binder_games -e /opt/mosaic_workflows/src/joltz"
     )
 )
 
@@ -60,7 +62,7 @@ def _default_steps(total: int = 20) -> Dict[str, int]:
     return {"warmup": w, "soft": s, "anneal": a}
 
 
-@app.function(gpu=modal.gpu.A10G(), timeout=3 * 60 * 60, volumes={"/root/.boltz": boltz_cache, "/results": results_vol})
+@app.function(gpu="A10G", timeout=3 * 60 * 60, volumes={"/root/.boltz": boltz_cache, "/results": results_vol})
 def run_mhetase(
     *,
     binder_len: int = 20,
@@ -100,7 +102,7 @@ def run_mhetase(
     except Exception as e:
         raise RuntimeError(f"GPU preflight failed: {e}")
 
-    workspace = Path("/workspace").resolve()
+    workspace = Path("/opt/mosaic_workflows").resolve()
     _add_paths(workspace)
 
     from mosaic_workflows import run_workflow

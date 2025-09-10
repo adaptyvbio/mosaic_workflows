@@ -112,6 +112,34 @@ workflow = {
 }
 ```
 
+Two-player losses (binder_games)
+--------------------------------
+You can build two-argument losses with `binder_games` and run them through the same workflow runner using a two-player optimizer/phase builder.
+
+```
+from binder_games import build_minmax_phase, make_minmax_loss
+
+def build_loss():
+  # returns two-argument loss: (x_probs, y_probs, key) -> (value, aux)
+  return make_minmax_loss(loss_x, loss_y, weight_y=1.0)
+
+phase = build_minmax_phase(
+  name="minmax",
+  build_loss=build_loss,
+  steps=120,
+  schedule=lambda g,p: {"lr_x": 0.05, "lr_y": 0.05, "temperature": 1.0},
+  transforms={
+    "x": {"pre_logits": [temperature_on_logits()]},
+    "y": {"pre_logits": [temperature_on_logits()]},
+  },
+)
+
+wf = {"phases": [phase], "binder_len": N, "seed": 42, "initial_x": x0}
+result = run_workflow(wf)
+```
+
+See also: `scripts/run_binder_games_boltz1_minmax.py` and `src/binder_games/README.md`.
+
 Stateful losses
 ---------------
 Mosaic’s stateful-loss pattern is supported. When an optimizer runs with update_loss_state=True, it will call the same update_states(aux, loss) logic Mosaic uses. Use this to interleave predictor recycling with optimization or to cache/update heavy intermediates.
