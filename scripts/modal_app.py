@@ -100,30 +100,11 @@ def run_mhetase(
     os.environ.setdefault("BOLTZ_CACHE", "/root/.boltz")
     Path(os.environ["BOLTZ_CACHE"]).mkdir(parents=True, exist_ok=True)
 
-    # Fail fast if no GPU is visible to JAX
-    try:
-        import jax
-        devs = jax.devices()
-        if not any(getattr(d, "platform", None) == "gpu" for d in devs):
-            raise RuntimeError(f"No GPU detected by JAX. Devices: {devs}")
-    except Exception as e:
-        raise RuntimeError(f"GPU preflight failed: {e}")
 
-    # Repo is already baked into the image at /repo
-    workspace = Path("/repo").resolve()
-    _add_paths(workspace)
-
-    # To remove
-    # Shim joltz exports to satisfy type annotations in upstream code
-    try:
-        import joltz as _j
-        if not hasattr(_j, "Joltz2"):
-            _j.Joltz2 = object  # type: ignore[attr-defined]
-        if not hasattr(_j, "ConfidenceMetrics"):
-            _j.ConfidenceMetrics = object  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
+    # Ensure baked repo is importable inside the container
+    repo_src = Path("/repo/src")
+    if str(repo_src) not in sys.path and repo_src.exists():
+        sys.path.insert(0, str(repo_src))
     from mosaic_workflows import run_workflow
     from mosaic_workflows.mhetase_scaffold import (
         build_boltz2_predict_fn_mhetase,
@@ -158,11 +139,10 @@ def run_mhetase(
         helix_weight=float(os.environ.get("HELIX_WEIGHT", "-0.3")),
     )
 
-    # Assign steps to phases: motif_lock + soft + anneal = 100 by default
-    # Allocate 30/40/30 if total_steps=100; scale proportionally otherwise
-    ml = max(1, int(0.3 * total_steps))
-    an = max(1, int(0.3 * total_steps))
-    sf = max(1, int(total_steps - (ml + an)))
+    # Assign steps to phases: motif_lock + soft + anneal 
+    ml = max(1, int(0.2 * total_steps))
+    sf = max(1, int(0.4 * total_steps))
+    an = max(1, int(total_steps - (ml + sf)))
     for p in wf["phases"]:
         if p["name"] == "motif_lock":
             p["steps"] = ml
@@ -206,7 +186,6 @@ def run_mhetase(
         key = jax.random.key(seed)
         from mosaic_workflows.mhetase_scaffold import (
             build_boltz2_predict_fn_mhetase as _bp,
-            _build_mhetase_yaml,
         )
         from mosaic.losses.boltz2 import load_features_and_structure_writer as _load_b2
         import gemmi
@@ -225,15 +204,21 @@ def run_mhetase(
             np.save(out_dir / "coords.npy", np.array(coords))
             # Rebuild YAML with final sequence so writer emits correct residue names
             best_seq = str(out.get("best_sequence", ""))
-            es_yaml = _build_mhetase_yaml(
-                binder_len=binder_len,
-                enzyme_chain=ligand.get("enzyme_chain", "A"),
-                ligand_chain=ligand.get("ligand_chain", "L"),
-                ligand_ccd=ligand.get("ccd"),
-                ligand_smiles=ligand.get("smiles"),
-                bond_constraints=None,
-                binder_sequence=best_seq if len(best_seq) == binder_len else None,
-            )
+            enzyme_chain = ligand.get("enzyme_chain", "A")
+            ligand_chain = ligand.get("ligand_chain", "L")
+            ligand_ccd = ligand.get("ccd")
+            ligand_smiles = ligand.get("smiles")
+            seq = best_seq if len(best_seq) == binder_len else ("X" * binder_len)
+            lines = [
+                "version: 1",
+                "sequences:",
+                f"  - protein:\n      id: {enzyme_chain}\n      sequence: {seq}\n      msa: empty",
+            ]
+            if ligand_ccd:
+                lines += [f"  - ligand:\n      id: {ligand_chain}\n      ccd: {ligand_ccd}"]
+            else:
+                lines += [f"  - ligand:\n      id: {ligand_chain}\n      smiles: '{ligand_smiles}'"]
+            es_yaml = "\n".join(lines)
             _features, writer = _load_b2(es_yaml, cache=Path(os.environ.get("BOLTZ_CACHE", "/root/.boltz")).expanduser())
             st = writer(coords)
             doc = st.make_mmcif_document()

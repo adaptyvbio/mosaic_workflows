@@ -8,8 +8,6 @@ import os
 from pathlib import Path
 
 from mosaic.common import LossTerm
-from binder_games.losses import make_minmax_loss
-from binder_games.optimizers import minmax_logits, alternating_br_logits, extragradient_minmax_logits
 from mosaic_workflows.design import run_workflow
 from mosaic_workflows.optimizers import adamw_logits_adapter as adamw_logits, sgd_logits_adapter as sgd_logits
 from mosaic_workflows.transforms import (
@@ -31,7 +29,14 @@ from mosaic.proteinmpnn.mpnn import ProteinMPNN
 from mosaic.losses.transformations import ClippedGradient
 # from mosaic.losses.wrappers import RiskWrappedLoss  - iffy implementation atm
 
-# Very WIP, need to clean up and simplify. Will then add all losses to mosaic and import from there + maybe a custom workflow for MHETases
+"""MHETase motif scaffolding workflow (clean, mosaic-style).
+
+Phases:
+- warmup: hallucination entropy + pLDDT (stabilize backbone)
+- anneal: full objective (motif geometry + contacts + pLDDT) with temperature decay
+
+Step counts are assigned by the caller (e.g., Modal app) and can be overridden externally.
+"""
 
 @functools.lru_cache(maxsize=1)
 def _get_mpnn() -> ProteinMPNN:
@@ -330,44 +335,7 @@ class HallucinationEntropyDist(LossTerm):
         return loss, {"halluc_entropy": loss}
 
 
-class BinderLigandContact(LossTerm):
-    def __init__(self, *, binder_positions: tuple[int, ...], desired_max_distance: float = 5.0):
-        object.__setattr__(self, "binder_positions", tuple(int(p) for p in binder_positions))
-        object.__setattr__(self, "desired_max_distance", float(desired_max_distance))
-
-    def __call__(self, sequence, output, key):
-        # Access full atom coordinates and mapping
-        coords_all = getattr(output, "structure_coordinates", None)
-        feats = getattr(output, "features", None)
-        if coords_all is None or feats is None:
-            zero = jnp.asarray(0.0, dtype=jnp.float32)
-            return zero, {"binder_lig_contact": zero}
-        coords = coords_all[0]  # [A,3]
-        atom_to_token = feats["atom_to_token"].T  # [num_atoms, num_tokens]
-        # Per-atom token index (assumes one-hot mapping)
-        token_idx = jnp.argmax(atom_to_token, axis=1)
-        binder_len = sequence.shape[0]
-        ligand_mask = token_idx >= binder_len
-        ligand_coords = coords[ligand_mask]
-        if ligand_coords.shape[0] == 0:
-            zero = jnp.asarray(0.0, dtype=jnp.float32)
-            return zero, {"binder_lig_contact": zero}
-
-        # Binder CA positions for specified residues
-        bb = output.backbone_coordinates  # [N,4,3]
-        ca = bb[:binder_len, 1, :]  # [L,3]
-
-        def min_dist_to_lig(pos_idx: int):
-            pos = jnp.clip(pos_idx, 0, jnp.maximum(binder_len - 1, 0))
-            p = ca[pos]
-            d2 = jnp.sum((ligand_coords - p) ** 2, axis=-1)
-            return jnp.sqrt(jnp.minimum(jnp.max(d2) + 0.0, jnp.min(d2) + 1e-9))
-
-        dmins = jnp.array([min_dist_to_lig(int(p)) for p in self.binder_positions], dtype=jnp.float32)
-        # Hinge loss: penalize distances above desired_max_distance
-        hinge = jnp.maximum(dmins - self.desired_max_distance, 0.0)
-        value = hinge.mean()
-        return value, {"binder_lig_min_d": dmins.mean(), "binder_lig_loss": value}
+## Removed BinderLigandContact to simplify the objective
 
 def _greedy_autoplace_motif(logp_all: jnp.ndarray, bins: jnp.ndarray, motif_template_ca: jnp.ndarray, max_pair_distance: float = 20.0) -> jnp.ndarray:
     """Greedy auto-placement of K motif residues onto N positions using distogram CCE.
@@ -601,7 +569,7 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
         probs0 = probs0 / (jnp.sum(probs0, axis=-1, keepdims=True) + 1e-8)
         out0 = predict(probs0, key=jax.random.key(0), state={})
         logp_b = jax.nn.log_softmax(out0.distogram_logits[:binder_len, :binder_len], axis=-1)
-        idx_auto = _greedy_autoplace_motif(logp_b, out0.distogram_bins, motif_template_ca.astype(np.float32), max_pair_distance=20.0)
+        idx_auto = _greedy_autoplace_motif(logp_b, jnp.asarray(out0.distogram_bins, dtype=jnp.float32), jnp.asarray(motif_template_ca, dtype=jnp.float32), max_pair_distance=20.0)
         autoplace_idx = tuple(int(x) for x in list(np.array(idx_auto)))
 
     def _build_motif_geo_loss():
@@ -626,7 +594,7 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
         # geo = RiskWrappedLoss(base=geo, risk_type="cvar", num_samples=8, alpha=0.3, temperature=1.0)
         return geo
 
-    # Single-stage design loss configuration (keep pLDDT throughout; stronger motif geometry)
+    # Single-stage design loss configuration (clean, mosaic-style)
     def build_loss_single(*, state: dict):
         def _fn(probs, key=None):
             # Enforce per-position allowed identities directly on probs before any prediction/loss
@@ -655,28 +623,12 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
                 + 0.1 * sp.PLDDTLoss()
             )
 
-            # Total objective: start from hallucination + aux; add motif terms; add binder–ligand contact scoped to motif±halo
+            # Total objective: start from hallucination + aux; add motif terms
             motif_geo = _build_motif_geo_loss()
-            # Build paratope indices from provided/auto-placed motif positions, with a small ±2 halo
-            halo = 2
-            if motif_positions_tuple is not None:
-                motif_idxs = list(motif_positions_tuple)
-            elif autoplace_idx is not None:
-                motif_idxs = list(autoplace_idx)
-            else:
-                motif_idxs = [ser, his, asp] + (list(oxy) if len(oxy) > 0 else [])
-            _paratope_list = sorted({int(np.clip(i + d, 0, binder_len - 1)) for i in motif_idxs for d in range(-halo, halo + 1)})
-            paratope_idx = jnp.asarray(_paratope_list, dtype=jnp.int32)
-            contact_loss = 1.5 * sp.BinderTargetContact(
-                contact_distance=5.0,
-                paratope_idx=paratope_idx,
-                epitope_idx=None,
-            )
-            struct = hallucination_loss + aux_loss + motif_geo + contact_loss
+            struct = hallucination_loss + aux_loss + motif_geo
 
-            # Loss-internal gradient shaping and risk aggregation
+            # Loss-internal gradient shaping
             struct = ClippedGradient(loss=struct, max_norm=1.0)
-            #struct = RiskWrappedLoss(base=struct, risk_type="cvar", num_samples=8, alpha=0.3, temperature=1.0)
 
             v_struct, aux_struct = struct(probs_masked, output=output, key=key)
 
@@ -698,18 +650,15 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
             return v_struct, aux
         return _fn
 
-    # BD1-style phases: warmup / soft / anneal
+    # Two-phase schedules
     def sched_warmup(g, p):
-        return {"learning_rate": 0.2, "temperature": 1.0, "e_soft": 1.0}
+        return {"lr": base_lr * inv_sqrt_L, "temperature": 1.0, "e_soft": 1.0}
 
     inv_sqrt_L = float(1.0 / max(1.0, np.sqrt(binder_len)))
     base_lr = 0.05  # paper-typical constant LR
 
-    def sched_soft(g, p):
-        return {"lr": base_lr * inv_sqrt_L, "temperature": 1.0, "e_soft": 0.8}
-
+    # Default internal values; external runners typically override `steps` per phase
     phase_warmup_steps = 40
-    phase_soft_steps = 120
     phase_anneal_steps = 240
 
     def sched_anneal(g, p):
@@ -732,32 +681,36 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
                 + 0.1 * sp.PLDDTLoss()
             )
             # Loss-internal gradient shaping for stability in warmup
-            losses = ClippedGradient(loss=losses, max_norm=1.0)
+            # losses = ClippedGradient(loss=losses, max_norm=1.0)
             v, aux = losses(probs_masked, output=output, key=key)
             return v, {"struct": aux}
         return _fn
 
-    # Motif-lock phase: emphasize motif geometry early
+    # Three phases: motif_lock (geometry only), soft (full at T=1, e_soft=0.8), anneal (temperature decay)
     def build_loss_motif_lock():
         def _fn(probs, key=None):
             mask = jnp.asarray(allowed_tokens, dtype=jnp.float32)
             probs_masked = probs * mask
             probs_masked = probs_masked / (jnp.sum(probs_masked, axis=-1, keepdims=True) + 1e-8)
             output = predict(probs_masked, key=key, state={})
-            motif_geo = _build_motif_geo_loss()
-            v, aux = motif_geo(probs_masked, output=output, key=key)
-            return v, {"motif_lock": aux}
+            geo = _build_motif_geo_loss()
+            geo = ClippedGradient(loss=geo, max_norm=1.0)
+            v, aux = geo(probs_masked, output=output, key=key)
+            return v, {"struct": aux}
         return _fn
+
+    def sched_soft(g, p):
+        return {"lr": base_lr * inv_sqrt_L, "temperature": 1.0, "e_soft": 0.8}
 
     phases = [
         {
             "name": "motif_lock",
             "build_loss": build_loss_motif_lock,
             "optimizer": sgd_logits,
-            "steps": 80,
-            "schedule": lambda g, p: {"lr": base_lr * inv_sqrt_L, "temperature": 1.0, "e_soft": 1.0},
+            "steps": max(1, int(0.2 * (phase_warmup_steps + phase_anneal_steps))),  # default; runner may override
+            "schedule": sched_warmup,
             "transforms": {
-                "pre_logits": [temperature_on_logits(), e_soft_on_logits()],
+                "pre_logits": [temperature_on_logits()],
                 "post_logits": [per_position_allowed_tokens(allowed_tokens)],
                 "grad": [position_mask(1.0 - fixed_mask), gradient_normalizer(mode="l2_effL")],
             },
@@ -768,7 +721,7 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
             "name": "soft",
             "build_loss": lambda: build_loss_single(state={}),
             "optimizer": sgd_logits,
-            "steps": phase_soft_steps,
+            "steps": phase_warmup_steps,  # default; runner may override
             "schedule": sched_soft,
             "transforms": {
                 "pre_logits": [temperature_on_logits(), e_soft_on_logits()],
