@@ -6,6 +6,7 @@ from typing import Literal
 from ..common import LossTerm
 
 
+# Would reimplement to be more similar to a Rao-Blackwellized version => add conditional noise, compute conditional expectation/CVaR, etc.
 class RiskWrappedLoss(LossTerm):
     """Generic risk-aggregation wrapper around a base LossTerm.
 

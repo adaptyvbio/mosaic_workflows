@@ -15,7 +15,7 @@ dependencies = [
     "ipymolstar>=0.0.9",
     "jax>=0.6.2",
     # joltz is vendored under src/joltz, removed its dep here
-    "boltz @ git+https://github.com/jwohlwend/boltz.git",
+    "boltz @ git+https://github.com/jwohlwend/boltz.git", # Might cause some joltz bugs, set to <2.0.3
     "einops>=0.8.0",
     "jaxtyping>=0.2.36",
     "marimo>=0.10.9",
@@ -102,4 +102,8 @@ conflicts = [
 ]
 package = true
 override-dependencies = ["scipy==1.15.1", "numpy==2.1"]
+
+
+[tool.hatch.metadata]
+allow-direct-references = true
 

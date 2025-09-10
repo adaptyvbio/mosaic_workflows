@@ -29,7 +29,7 @@ import mosaic.losses.structure_prediction as sp
 from mosaic.losses.protein_mpnn import ProteinMPNNLoss
 from mosaic.proteinmpnn.mpnn import ProteinMPNN
 from mosaic.losses.transformations import ClippedGradient
-from mosaic.losses.wrappers import RiskWrappedLoss
+# from mosaic.losses.wrappers import RiskWrappedLoss  - iffy implementation atm
 
 # Very WIP, need to clean up and simplify. Will then add all losses to mosaic and import from there + maybe a custom workflow for MHETases
 
@@ -423,12 +423,13 @@ def _greedy_autoplace_motif(logp_all: jnp.ndarray, bins: jnp.ndarray, motif_temp
 
     return jnp.asarray(placed, dtype=jnp.int32)
 
-def _build_mhetase_yaml(*, binder_len: int, enzyme_chain: str = "A", ligand_chain: str = "L", ligand_ccd: str | None = None, ligand_smiles: str | None = None, bond_constraints: list[dict] | None = None) -> str:
+def _build_mhetase_yaml(*, binder_len: int, enzyme_chain: str = "A", ligand_chain: str = "L", ligand_ccd: str | None = None, ligand_smiles: str | None = None, bond_constraints: list[dict] | None = None, binder_sequence: str | None = None) -> str:
     if not (ligand_ccd or ligand_smiles):
         raise ValueError("Provide ligand_ccd or ligand_smiles")
     # Build sequences block
     lines = ["version: 1", "sequences:"]
-    lines.append(f"  - protein:\n      id: {enzyme_chain}\n      sequence: {'X'*binder_len}\n      msa: empty")
+    seq = binder_sequence if (binder_sequence is not None and len(binder_sequence) == binder_len) else ("X" * binder_len)
+    lines.append(f"  - protein:\n      id: {enzyme_chain}\n      sequence: {seq}\n      msa: empty")
     if ligand_ccd:
         lines.append(f"  - ligand:\n      id: {ligand_chain}\n      ccd: {ligand_ccd}")
     else:
@@ -621,8 +622,8 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
                 def __call__(self, *a, **k):
                     return jnp.asarray(0.0, dtype=jnp.float32), {}
             geo = _Zero()
-        # CVaR aggregation for robustness
-        geo = RiskWrappedLoss(base=geo, risk_type="cvar", num_samples=8, alpha=0.3, temperature=1.0)
+        # CVaR aggregation for robustness - bad implementation, will fix
+        # geo = RiskWrappedLoss(base=geo, risk_type="cvar", num_samples=8, alpha=0.3, temperature=1.0)
         return geo
 
     # Single-stage design loss configuration (keep pLDDT throughout; stronger motif geometry)

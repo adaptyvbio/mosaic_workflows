@@ -32,15 +32,16 @@ image = (
         # Git-only deps needed at runtime
         "python -m pip install git+https://github.com/escalante-bio/jablang.git && "
         "python -m pip install git+https://github.com/escalante-bio/esmj.git && "
+        # Install joltz (JAX translation of Boltz) so joltz.backend is importable
+        "python -m pip install git+https://github.com/adaptyvbio/joltz.git && "
         # Omit protenij here to keep numpy compatibility with boltz; but will add later if needed
         # "python -m pip install git+https://github.com/escalante-bio/protenij.git && "
         # Boltz models and tooling (required by mosaic.losses.boltz2)
         "python -m pip install git+https://github.com/jwohlwend/boltz.git && "
         # Additional deps mirrored from pyproject to avoid resolver conflicts
         "python -m pip install esm2quinox==0.1.0 ipymolstar>=0.0.9 matplotlib>=3.10.0 && "
-        # Bake repo and all deps from its pyproject into the image
-        "git clone --depth 1 https://github.com/adaptyvbio/mosaic_workflows.git /repo && "
-        "python -m pip install -e /repo --no-deps"
+        # Bake repo source into the image and import via sys.path (avoid pyproject resolution here)
+        "git clone --depth 1 https://github.com/adaptyvbio/mosaic_workflows.git /repo"
     )
 )
 
@@ -111,6 +112,17 @@ def run_mhetase(
     # Repo is already baked into the image at /repo
     workspace = Path("/repo").resolve()
     _add_paths(workspace)
+
+    # To remove
+    # Shim joltz exports to satisfy type annotations in upstream code
+    try:
+        import joltz as _j
+        if not hasattr(_j, "Joltz2"):
+            _j.Joltz2 = object  # type: ignore[attr-defined]
+        if not hasattr(_j, "ConfidenceMetrics"):
+            _j.ConfidenceMetrics = object  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     from mosaic_workflows import run_workflow
     from mosaic_workflows.mhetase_scaffold import (
@@ -196,10 +208,7 @@ def run_mhetase(
             build_boltz2_predict_fn_mhetase as _bp,
             _build_mhetase_yaml,
         )
-        from mosaic.losses.boltz2 import (
-            load_features_and_structure_writer as _load_b2,
-            set_binder_sequence as _set_b2_seq,
-        )
+        from mosaic.losses.boltz2 import load_features_and_structure_writer as _load_b2
         import gemmi
         pred = _bp(
             binder_len=binder_len,
@@ -214,7 +223,8 @@ def run_mhetase(
         coords = getattr(pout, "structure_coordinates", None)
         if coords is not None:
             np.save(out_dir / "coords.npy", np.array(coords))
-            # Use writer to emit PDB
+            # Rebuild YAML with final sequence so writer emits correct residue names
+            best_seq = str(out.get("best_sequence", ""))
             es_yaml = _build_mhetase_yaml(
                 binder_len=binder_len,
                 enzyme_chain=ligand.get("enzyme_chain", "A"),
@@ -222,17 +232,13 @@ def run_mhetase(
                 ligand_ccd=ligand.get("ccd"),
                 ligand_smiles=ligand.get("smiles"),
                 bond_constraints=None,
+                binder_sequence=best_seq if len(best_seq) == binder_len else None,
             )
-            features_w, writer = _load_b2(es_yaml, cache=Path(os.environ.get("BOLTZ_CACHE", "/root/.boltz")).expanduser())
-            hard_seq = (probs_best == probs_best.max(axis=-1, keepdims=True)).astype(np.float32)
-            features_w = _set_b2_seq(hard_seq, features_w)
+            _features, writer = _load_b2(es_yaml, cache=Path(os.environ.get("BOLTZ_CACHE", "/root/.boltz")).expanduser())
             st = writer(coords)
-            # Write mmCIF as a robust fallback
-            cif = gemmi.cif.Document()
-            block = st.make_mmcif_block()
-            cif.add_block(block)
+            doc = st.make_mmcif_document()
             with open(out_dir / "final.cif", "w") as fh:
-                fh.write(cif.as_string())
+                fh.write(doc.as_string())
     except Exception as e:
         (out_dir / "warn.txt").write_text(f"structure save failed: {e}")
 
