@@ -11,7 +11,7 @@ import modal
 # Base image with Python + common scientific stack; adjust as needed.
 # For GPU runs, set gpu=modal.gpu.A10G() on the function below and add CUDA wheels.
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.debian_slim(python_version="3.12.0")
     .apt_install("git")
     .env({
         "BOLTZ_CACHE": "/root/.boltz",
@@ -21,11 +21,13 @@ image = (
         "python -m pip install -U pip setuptools wheel && "
         # CUDA PyTorch for GPU (pulls CUDA runtime libs)
         "python -m pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.2.1 && "
-        # JAX core and CUDA plugin for 0.6.2
-        "python -m pip install --upgrade jax==0.6.2 && "
-        "python -m pip install --upgrade jax-cuda12-plugin==0.6.2 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html && "
+        # JAX core and CUDA plugin (pin compatible versions)
+        "python -m pip install --upgrade jax==0.7.1 && "
+        "python -m pip install --upgrade jax-cuda12-plugin==0.7.1 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html && "
         # PTX toolchain
         "python -m pip install nvidia-cuda-nvcc-cu12==12.8.93 && "
+        # Core JAX ecosystem deps used by workflows
+        "python -m pip install optax==0.2.4 dm-haiku>=0.0.13 flax>=0.10.2 ml-collections>=1.0.0 httpx>=0.28.1 && "
         # Git-only deps needed at runtime
         "python -m pip install git+https://github.com/escalante-bio/jablang.git && "
         "python -m pip install git+https://github.com/escalante-bio/esmj.git && "
