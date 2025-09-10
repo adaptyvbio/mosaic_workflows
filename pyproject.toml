@@ -14,8 +14,8 @@ dependencies = [
     "gemmi>=0.6.5",
     "ipymolstar>=0.0.9",
     "jax>=0.6.2",
-    # joltz is vendored under src/joltz; include its third-party deps here
-    "boltz>=2.0.3",
+    # joltz is vendored under src/joltz, removed its dep here
+    "boltz @ git+https://github.com/jwohlwend/boltz.git",
     "einops>=0.8.0",
     "jaxtyping>=0.2.36",
     "marimo>=0.10.9",
@@ -23,14 +23,14 @@ dependencies = [
     "ml-collections>=1.0.0",
     "optax>=0.2.4",
     "esmj",
-    "scipy==1.15.1",
+    "scipy==1.13.1",
     "ablang>=0.3.1",
     "jablang",
     "torchvision>=v0.22.0",
     "equinox>=0.13.0",
     "torch>=2.7.1",
-    "numpy==2.1",
-    "protenix",
+    "numpy==1.26.4",
+    # protenix requires numpy>=2.1; install optionally if needed
     "httpx>=0.28.1",
 ]
 

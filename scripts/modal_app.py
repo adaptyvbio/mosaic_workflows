@@ -1,5 +1,6 @@
 import os
 import sys
+import subprocess
 from pathlib import Path
 from typing import Any, Dict
 
@@ -27,11 +28,19 @@ image = (
         # PTX toolchain
         "python -m pip install nvidia-cuda-nvcc-cu12==12.8.93 && "
         # Core JAX ecosystem deps used by workflows
-        "python -m pip install optax==0.2.4 dm-haiku>=0.0.13 flax>=0.10.2 ml-collections>=1.0.0 httpx>=0.28.1 && "
+        "python -m pip install optax==0.2.4 dm-haiku>=0.0.13 flax>=0.10.2 ml-collections>=1.0.0 httpx>=0.28.1 gemmi>=0.6.0 && "
         # Git-only deps needed at runtime
         "python -m pip install git+https://github.com/escalante-bio/jablang.git && "
         "python -m pip install git+https://github.com/escalante-bio/esmj.git && "
-        "python -m pip install git+https://github.com/escalante-bio/protenij.git"
+        # Omit protenij here to keep numpy compatibility with boltz; but will add later if needed
+        # "python -m pip install git+https://github.com/escalante-bio/protenij.git && "
+        # Boltz models and tooling (required by mosaic.losses.boltz2)
+        "python -m pip install git+https://github.com/jwohlwend/boltz.git && "
+        # Additional deps mirrored from pyproject to avoid resolver conflicts
+        "python -m pip install esm2quinox==0.1.0 ipymolstar>=0.0.9 matplotlib>=3.10.0 && "
+        # Bake repo and all deps from its pyproject into the image
+        "git clone --depth 1 https://github.com/adaptyvbio/mosaic_workflows.git /repo && "
+        "python -m pip install -e /repo --no-deps"
     )
 )
 
@@ -99,18 +108,8 @@ def run_mhetase(
     except Exception as e:
         raise RuntimeError(f"GPU preflight failed: {e}")
 
-    # Clone repo at runtime (avoid uploading local code); use secret GITHUB_TOKEN if available
-    repo_dir = Path("/repo").resolve()
-    try:
-        if not repo_dir.exists() or not any(repo_dir.iterdir()):
-            import subprocess
-            token = os.environ.get("GITHUB_TOKEN", "")
-            url = "https://github.com/adaptyvbio/mosaic_workflows.git" if not token else f"https://x-access-token:{token}@github.com/adaptyvbio/mosaic_workflows.git"
-            subprocess.run(["git", "clone", "--depth", "1", url, str(repo_dir)], check=True)
-    except Exception:
-        pass
-
-    workspace = repo_dir
+    # Repo is already baked into the image at /repo
+    workspace = Path("/repo").resolve()
     _add_paths(workspace)
 
     from mosaic_workflows import run_workflow

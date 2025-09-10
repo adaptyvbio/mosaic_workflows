@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+from typing import Any
 from functools import cached_property
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -226,7 +227,7 @@ def set_binder_sequence(
 # TODO: remove some batch dimensions
 @dataclass
 class Boltz2Output(AbstractStructureOutput):
-    joltz2: joltz.Joltz2
+    joltz2: Any
     features: PyTree
     deterministic: bool
     key: jax.Array
@@ -299,7 +300,7 @@ class Boltz2Output(AbstractStructureOutput):
             )
         
     @cached_property
-    def confidence_metrics(self) -> joltz.ConfidenceMetrics:
+    def confidence_metrics(self) -> Any:
         print("JIT compiling confidence module...")
         return self.joltz2.confidence_module(
             s_inputs=self.initial_embedding.s_inputs,
