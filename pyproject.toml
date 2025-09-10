@@ -1,10 +1,10 @@
 [project]
-name = "mosaic"
+name = "mosaic_workflows"
 version = "0.1.0"
-description = "composite objective protein design"
+description = "Orchestrate protein design workflows with multiple steps and stages"
 readme = "README.md"
 authors = [
-    { name = "Nick Boyd", email = "nick@escalante.bio" }
+    { name = "Tudor-Stefan Cotet", email = "tudor@adaptyvbio.com"}
 ]
 requires-python = "==3.12.*"
 dependencies = [
@@ -14,7 +14,10 @@ dependencies = [
     "gemmi>=0.6.5",
     "ipymolstar>=0.0.9",
     "jax>=0.6.2",
-    "joltz",
+    # joltz is vendored under src/joltz; include its third-party deps here
+    "boltz>=2.0.3",
+    "einops>=0.8.0",
+    "jaxtyping>=0.2.36",
     "marimo>=0.10.9",
     "matplotlib>=3.10.0",
     "ml-collections>=1.0.0",
@@ -42,6 +45,32 @@ jax-tpu= [
   "jax[tpu]",
 ]
 
+# Optional install groups for convenience
+games = [
+  "equinox>=0.13.0",
+  "einops>=0.8.0",
+  "jaxtyping>=0.2.36",
+]
+workflows = [
+  "gemmi>=0.6.5",
+  "ipymolstar>=0.0.9",
+  "matplotlib>=3.10.0",
+  "marimo>=0.13.15",
+  "httpx>=0.28.1",
+  "modal>=0.64.0",
+]
+all = [
+  "equinox>=0.13.0",
+  "einops>=0.8.0",
+  "jaxtyping>=0.2.36",
+  "gemmi>=0.6.5",
+  "ipymolstar>=0.0.9",
+  "matplotlib>=3.10.0",
+  "marimo>=0.13.15",
+  "httpx>=0.28.1",
+  "modal>=0.64.0",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -60,7 +89,6 @@ explicit = true
 torch = { index = "pytorch" }
 torchvision = { index = "pytorch" }
 jablang = { git = "https://github.com/escalante-bio/jablang" }
-joltz = { git = "https://github.com/nboyd/joltz" }
 esmj = { git = "https://github.com/escalante-bio/esmj" }
 protenix = { git = "https://github.com/escalante-bio/protenij" }
 

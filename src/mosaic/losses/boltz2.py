@@ -125,8 +125,8 @@ def load_features_and_structure_writer(
         out_dir=out_dir,
         ccd_path=ccd_path,
         mol_dir=mol_dir,
-        use_msa_server=True,
-        msa_server_url="https://api.colabfold.com",
+        use_msa_server=False,
+        msa_server_url=None,
         msa_pairing_strategy="greedy",
         boltz2=True,
     )
@@ -333,7 +333,7 @@ class Boltz2Output(AbstractStructureOutput):
         return np.arange(start=0.5 * bin_width, stop=end, step=bin_width)
 
     @property
-    def backbone_coordinates(self) -> Float[Array, "N 4"]:
+    def backbone_coordinates(self) -> Float[Array, "N 4 3"]:
         features = jax.tree.map(lambda x: x[0], self.features)
         # In order these are N, C-alpha, C, O
         assert ref_atoms["UNK"][:4] == ["N", "CA", "C", "O"]
@@ -376,4 +376,3 @@ class Boltz2Loss(LossTerm):
         )
 
         return v, {self.name : aux}
-

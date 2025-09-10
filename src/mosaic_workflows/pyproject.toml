@@ -1,0 +1,19 @@
+[project]
+name = "mosaic_workflows"
+version = "0.1.0"
+description = "Mosaic workflows for protein design"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mosaic",
+    "binder_games",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mosaic_workflows*"]
+namespaces = false

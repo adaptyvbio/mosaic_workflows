@@ -5,6 +5,16 @@ build/
 dist/
 wheels/
 *.egg-info
+.mypy_cache/
 
 # Virtual environments
 .venv
+
+# Mac 
+.DS_Store
+
+# Cursor
+.specstory/
+
+# Others
+_backups/
