@@ -1,7 +1,0 @@
-
-# Python packaging 
-**/__pycache__
-*.egg-info/
-
-# Files made by the example script
-test_prediction/
