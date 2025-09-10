@@ -247,6 +247,19 @@ phase = build_minmax_phase(
 Reference: `src/binder_games/README.md`.
 
 ---
+
+#### joltz (JAX wrapper for Boltz)
+
+- JAX/Equinox translation layer for Boltz models. Used by `mosaic.losses.boltz.load_boltz()` to load Torch checkpoints into JAX.
+- Core API: `from_torch(obj)` to convert Torch modules/params; `register_from_torch(torch_module_type)` to add custom mappings; built-ins for common layers (Linear, LayerNorm, Sequential, Embedding, activations).
+- See `src/joltz/README.md` for API and testing parity (`TestModule`) to validate conversions.
+
+```python
+from mosaic.losses.boltz import load_boltz
+boltz1 = load_boltz()  # returns an Equinox module built via joltz.from_torch
+```
+
+---
 ## Mosaic: Functional, multi-objective protein design using continuous relaxation
 
 
