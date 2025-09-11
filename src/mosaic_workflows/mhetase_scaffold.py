@@ -17,16 +17,9 @@ from mosaic_workflows.transforms import (
     per_position_allowed_tokens,
     position_mask,
 )
-from mosaic.losses.boltz2 import (
-    load_boltz2,
-    load_features_and_structure_writer as load_boltz2_features,
-    set_binder_sequence as set_boltz2_binder_sequence,
-    Boltz2Output,
-)
+# Lazy import boltz2 pieces at use-time to avoid heavy deps during simple unit tests
 import mosaic.losses.structure_prediction as sp
-from mosaic.losses.protein_mpnn import ProteinMPNNLoss
-from mosaic.proteinmpnn.mpnn import ProteinMPNN
-from mosaic.losses.transformations import ClippedGradient
+from mosaic.losses.transformations import ClippedGradient, NormedGradient
 # from mosaic.losses.wrappers import RiskWrappedLoss  - iffy implementation atm
 
 """MHETase motif scaffolding workflow (clean, mosaic-style).
@@ -39,8 +32,10 @@ Step counts are assigned by the caller (e.g., Modal app) and can be overridden e
 """
 
 @functools.lru_cache(maxsize=1)
-def _get_mpnn() -> ProteinMPNN:
-    return ProteinMPNN()
+def _get_mpnn():
+    # Lazy import to avoid heavy deps during light tests
+    from mosaic.proteinmpnn.mpnn import ProteinMPNN as _ProteinMPNN
+    return _ProteinMPNN()
 
 
 class CatalyticMotifLoss(LossTerm):
@@ -280,6 +275,7 @@ class MotifDistogramCCE(LossTerm):
     def __call__(self, sequence, output, key):
         binder_len = sequence.shape[0]
         logits = output.distogram_logits[:binder_len, :binder_len]  # [N,N,B]
+        logits = jnp.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
         bins = output.distogram_bins  # [B]
         # Map template CA distances to nearest bin indices
         idx = jnp.asarray(self.motif_positions, dtype=jnp.int32)
@@ -315,6 +311,7 @@ class HallucinationEntropyDist(LossTerm):
     def __call__(self, sequence, output, key):
         binder_len = sequence.shape[0]
         logits = output.distogram_logits[:binder_len, :binder_len]  # [N,N,B]
+        logits = jnp.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
         bins = output.distogram_bins  # [B]
         # build mask excluding motif positions and diagonal
         N = binder_len
@@ -333,6 +330,127 @@ class HallucinationEntropyDist(LossTerm):
         # average over allowed pairs
         loss = jnp.where(pair_mask.sum() > 0, (entropy * pair_mask).sum() / pair_mask.sum(), 0.0)
         return loss, {"halluc_entropy": loss}
+
+
+class HallucinationEntropyLeaky(LossTerm):
+    def __init__(self, *, excluded_positions: tuple[int, ...] = (), beta: float = 10.0, max_contact_bin: float | None = 5.0):
+        object.__setattr__(self, "excluded_positions", tuple(int(p) for p in excluded_positions))
+        object.__setattr__(self, "beta", float(beta))
+        object.__setattr__(self, "max_contact_bin", None if max_contact_bin is None else float(max_contact_bin))
+
+    def __call__(self, sequence, output, key):
+        binder_len = sequence.shape[0]
+        logits = output.distogram_logits[:binder_len, :binder_len]  # [N,N,B]
+        bins = output.distogram_bins  # [B]
+
+        N = binder_len
+        excl = jnp.zeros((N,), dtype=bool).at[jnp.asarray(self.excluded_positions, dtype=jnp.int32)].set(True)
+        pair_mask = (~excl[:, None]) & (~excl[None, :]) & (~jnp.eye(N, dtype=bool))
+
+        # Masks over bins: exclude last bin; optionally restrict to <= max_contact_bin for the sum
+        B = logits.shape[-1]
+        last_idx = B - 1
+        allow_bins = jnp.ones((B,), dtype=bool).at[last_idx].set(False)
+        if self.max_contact_bin is not None:
+            allow_bins = allow_bins & (bins <= self.max_contact_bin)
+
+        # p over all bins; q_all is softmax over all bins with beta scaling as in supplement
+        logp = jax.nn.log_softmax(logits, axis=-1)
+        q_all = jax.nn.softmax(self.beta * logp, axis=-1)  # [N,N,B]
+
+        # p_hat excludes the last bin, renormalized over allowed bins
+        mask_allow = allow_bins[None, None, :]
+        logp_masked = jnp.where(mask_allow, logp, -1e9)
+        p_hat = jax.nn.softmax(self.beta * logp_masked, axis=-1)
+
+        # Compute leaky entropy: -sum_{k in allowed, k != last} p_hat_k * log q_all_k
+        contrib = -(p_hat * jnp.log(jnp.clip(q_all, 1e-12))).sum(axis=-1)
+
+        # Exclude bins not allowed from summation by subtracting their contributions (since p_hat there ~0 it is fine)
+        loss_mat = jnp.where(pair_mask, contrib, 0.0)
+        denom = pair_mask.sum()
+        loss = jnp.where(denom > 0, loss_mat.sum() / denom, 0.0)
+        return loss, {"halluc_entropy_leaky": loss}
+
+
+class SurfaceNonPolarLoss(LossTerm):
+    def __init__(self, *, n0: float = 2.5, m: float = 1.0, a: float = 0.5, b: float = 2.0):
+        object.__setattr__(self, "n0", float(n0))
+        object.__setattr__(self, "m", float(m))
+        object.__setattr__(self, "a", float(a))
+        object.__setattr__(self, "b", float(b))
+
+    @staticmethod
+    def _pseudo_cb_from_backbone(bb_ncac: jnp.ndarray) -> jnp.ndarray:
+        # bb_ncac: [L,3,3] (N,CA,C)
+        return MotifPseudoCBRMSD._pseudo_cb_batch(bb_ncac)
+
+    def __call__(self, sequence, output, key):
+        # sequence: [L,20] probabilities (after masking); output carries backbone coords
+        probs = jnp.nan_to_num(sequence, nan=0.0, posinf=0.0, neginf=0.0)
+        L = probs.shape[0]
+        bb = getattr(output, "backbone_coordinates")  # [N,4,3] in N,CA,C,O order
+        nca = jnp.nan_to_num(bb[:L, [0, 1, 2], :], nan=0.0, posinf=0.0, neginf=0.0)  # [L,3,3]
+        cb = self._pseudo_cb_from_backbone(nca)  # [L,3]
+        ca = nca[:, 1, :]  # [L,3]
+
+        # Direction vectors CA->CB per residue
+        v = cb - ca
+        v = v / (jnp.linalg.norm(v, axis=-1, keepdims=True) + 1e-8)
+
+        # Pairwise vectors and distances
+        diff = cb[:, None, :] - cb[None, :, :]  # [L,L,3]
+        d = jnp.linalg.norm(diff, axis=-1)  # [L,L]
+        # Angle between CA->CB (at i) and vector to neighbor j (CB_j - CB_i)
+        vi = v[:, None, :]  # [L,1,3]
+        vij = diff / (jnp.linalg.norm(diff, axis=-1, keepdims=True) + 1e-8)  # [L,L,3]
+        cos_phi = jnp.clip(jnp.sum(vi * vij, axis=-1), -1.0, 1.0)  # [L,L]
+        # Use cos(pi - phi) = -cos(phi)
+        cone = (-cos_phi + self.a) / (1.0 + self.a)
+        cone = jnp.power(jnp.maximum(cone, 0.0), self.b)
+
+        # Distance weighting 1/(1 + exp(d - m)) on CB-CB distance
+        w_d = 1.0 / (1.0 + jnp.exp(d - self.m))
+
+        # Exclude self-pairs
+        mask = ~jnp.eye(L, dtype=bool)
+        neigh = jnp.where(mask, w_d * cone, 0.0).sum(axis=-1)  # [L]
+
+        # Surface indicator ~ 1 - sigmoid(n_i - n0)
+        surf = 1.0 - jax.nn.sigmoid(neigh - self.n0)
+
+        # Expected non-polar probability at each residue from soft sequence
+        vocab = "ARNDCQEGHILKMFPSTWYV"
+        nonpolar = ("V", "I", "L", "M", "W", "F")
+        idxs = jnp.array([vocab.index(x) for x in nonpolar], dtype=jnp.int32)
+        p_nonpolar = probs[:, idxs].sum(axis=-1)  # [L]
+
+        # Loss = average p_nonpolar over surface residues
+        denom = surf.sum()
+        num = (p_nonpolar * surf).sum()
+        loss = jnp.where(denom > 0, num / denom, jnp.asarray(0.0, dtype=jnp.float32))
+        return loss, {"surface_nonpolar": loss, "n_surface_mean": surf.mean()}
+
+
+class NetChargeLoss(LossTerm):
+    def __init__(self, *, target_max_charge: float = -5.0, normalize_by_length: bool = True):
+        object.__setattr__(self, "target_max_charge", float(target_max_charge))
+        object.__setattr__(self, "normalize_by_length", bool(normalize_by_length))
+
+    def __call__(self, sequence, output, key):
+        probs = sequence  # [L,20]
+        L = probs.shape[0]
+        vocab = "ARNDCQEGHILKMFPSTWYV"
+        def idx(a):
+            return jnp.asarray(vocab.index(a), dtype=jnp.int32)
+        pos = probs[:, idx("K")] + probs[:, idx("R")]
+        neg = probs[:, idx("D")] + probs[:, idx("E")]
+        net = (pos - neg).sum()
+        if self.normalize_by_length:
+            net = net / (jnp.maximum(jnp.asarray(L, dtype=jnp.float32), 1.0))
+        # Hinge at target_max_charge (e.g., -5 or per-length normalized value)
+        penalty = jnp.maximum(net - self.target_max_charge, 0.0)
+        return penalty, {"net_charge": net, "net_charge_penalty": penalty}
 
 
 ## Removed BinderLigandContact to simplify the objective
@@ -414,6 +532,16 @@ def _build_mhetase_yaml(*, binder_len: int, enzyme_chain: str = "A", ligand_chai
 
 
 def build_boltz2_predict_fn_mhetase(*, binder_len: int, enzyme_chain: str, ligand_chain: str, ligand_ccd: str | None = None, ligand_smiles: str | None = None, num_sampling_steps: int = 200, recycling_steps: int = 3):
+    # Lazy import here to avoid heavy deps when only testing losses locally
+    try:
+        from mosaic.losses.boltz2 import (
+            load_boltz2,
+            load_features_and_structure_writer as load_boltz2_features,
+            set_binder_sequence as set_boltz2_binder_sequence,
+            Boltz2Output,
+        )
+    except Exception as e:
+        raise RuntimeError("Boltz2 dependencies are not available. Use a mock predict_fn for local tests.") from e
     joltz2 = load_boltz2()
 
     es_yaml = _build_mhetase_yaml(
@@ -491,7 +619,7 @@ def build_tmol_energy_fn(tmol_context, predict_fn):
     return energy_fn
 
 
-def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict, predict_fn=None, es_star_forced_bonds: tuple[tuple[int, int], ...] | None = None, motif_template_ca: np.ndarray | None = None, motif_template_backbone: np.ndarray | None = None, avoid_residues: tuple[str, ...] = ("C",), ligand_metric: str = "iptm", pae_on: bool = True, helix_weight: float = -0.3, mpnn_weight: float = 0.0):
+def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict, predict_fn=None, es_star_forced_bonds: tuple[tuple[int, int], ...] | None = None, motif_template_ca: np.ndarray | None = None, motif_template_backbone: np.ndarray | None = None, avoid_residues: tuple[str, ...] = ("C",), ligand_metric: str = "iptm", pae_on: bool = True, helix_weight: float = -0.3, mpnn_weight: float = 0.0, use_leaky_entropy_soft: bool = False, use_leaky_entropy_anneal: bool = True, surface_nonpolar_weight_soft: float = 0.0, surface_nonpolar_weight_anneal: float = 0.5, net_charge_weight_soft: float = 0.0, net_charge_weight_anneal: float = 0.05, net_charge_target: float = -5.0, snp_n0: float = 2.5, entropy_beta: float = 10.0, entropy_max_contact_bin: float = 5.0, anneal_min_temp: float = 0.01, include_struct_priors_soft: bool = True, include_struct_priors_anneal: bool = True):
     ser_val = motif_positions.get("ser")
     his_val = motif_positions.get("his")
     asp_val = motif_positions.get("asp")
@@ -577,67 +705,97 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
         if motif_template_ca is not None:
             pos = motif_positions_tuple if motif_positions_tuple is not None else (autoplace_idx if autoplace_idx is not None else None)
             if pos is not None:
-                geo = 1.5 * MotifDistogramCCE(
+                geo = 2.0 * MotifDistogramCCE(
                     motif_positions=pos,
                     motif_template_ca=motif_template_ca.astype(np.float32),
                     max_pair_distance=20.0,
                 )
         if motif_struct is not None:
-            geo = geo + 0.75 * motif_struct() if geo is not None else (0.75 * motif_struct())
+            geo_term = 1.0 * motif_struct()
+            geo = geo + geo_term if geo is not None else geo_term
         if geo is None:
             # fallback to zero-loss
             class _Zero(LossTerm):
                 def __call__(self, *a, **k):
                     return jnp.asarray(0.0, dtype=jnp.float32), {}
             geo = _Zero()
-        # CVaR aggregation for robustness - bad implementation, will fix
-        # geo = RiskWrappedLoss(base=geo, risk_type="cvar", num_samples=8, alpha=0.3, temperature=1.0)
+        # Stabilize motif geometry with normalized gradients only
+        geo = NormedGradient(loss=geo)
         return geo
 
     # Single-stage design loss configuration (clean, mosaic-style)
-    def build_loss_single(*, state: dict):
+    def build_loss_single(*, state, use_leaky_entropy=False, surface_nonpolar_weight=0.0, net_charge_weight=0.0, net_charge_target=-5.0, snp_n0=2.5, entropy_beta_local: float | None = None, entropy_max_contact_bin_local: float | None = None, include_struct_priors: bool = True):
         def _fn(probs, key=None):
             # Enforce per-position allowed identities directly on probs before any prediction/loss
             mask = jnp.asarray(allowed_tokens, dtype=jnp.float32)
             probs_masked = probs * mask
             probs_masked = probs_masked / (jnp.sum(probs_masked, axis=-1, keepdims=True) + 1e-8)
+            probs_masked = jnp.nan_to_num(probs_masked, nan=1.0/20.0, posinf=0.0, neginf=0.0)
 
             output = predict(probs_masked, key=key, state=state)
             # Complete objective following paper: w_M * ℒ_M + w_H * ℒ_H + ℒ_aux (w_M = w_H = 1)
             # ℒ_M = motif geometric loss, ℒ_H = hallucination entropy loss, ℒ_aux = structure losses
 
             # Hallucination loss ℒ_H (entropy of renormalized predictions)
-            hallucination_loss = 1.0 * HallucinationEntropyDist(
-                excluded_positions=motif_positions_tuple if motif_positions_tuple else (),
-                beta=10.0,  # β = 10 as per paper
-                max_contact_bin=5.0,  # Only bins up to 5 Å as per paper
-            )
-
-            # Auxiliary losses ℒ_aux (structure quality)
-            aux_loss = (
-                1.0 * sp.WithinBinderContact(
-                    max_contact_distance=14.0,
-                    num_contacts_per_residue=4,
-                    min_sequence_separation=8,
+            beta_val = float(entropy_beta if entropy_beta_local is None else entropy_beta_local)
+            max_bin_val = float(entropy_max_contact_bin if entropy_max_contact_bin_local is None else entropy_max_contact_bin_local)
+            if use_leaky_entropy:
+                hallucination_loss = 1.0 * HallucinationEntropyLeaky(
+                    excluded_positions=motif_positions_tuple if motif_positions_tuple else (),
+                    beta=beta_val,
+                    max_contact_bin=max_bin_val,
                 )
-                + 0.1 * sp.PLDDTLoss()
-            )
+            else:
+                hallucination_loss = 1.0 * HallucinationEntropyDist(
+                    excluded_positions=motif_positions_tuple if motif_positions_tuple else (),
+                    beta=beta_val,
+                    max_contact_bin=max_bin_val,
+                )
 
-            # Total objective: start from hallucination + aux; add motif terms
+            # Auxiliary structural priors (toggleable)
+            aux_loss = None
+            if bool(include_struct_priors):
+                aux_loss = (
+                    1.0 * sp.WithinBinderContact(
+                        max_contact_distance=14.0,
+                        num_contacts_per_residue=4,
+                        min_sequence_separation=8,
+                    )
+                    + 0.1 * sp.PLDDTLoss()
+                )
+                if bool(pae_on):
+                    aux_loss = aux_loss + 0.2 * sp.WithinBinderPAE()
+                if float(helix_weight) != 0.0:
+                    aux_loss = aux_loss + float(helix_weight) * sp.HelixLoss()
+
+            # Surface nonpolar penalty and net charge (optional)
+            if float(surface_nonpolar_weight) > 0.0:
+                base = aux_loss if aux_loss is not None else (0 * hallucination_loss)
+                aux_loss = base + float(surface_nonpolar_weight) * SurfaceNonPolarLoss(n0=float(snp_n0))
+            if float(net_charge_weight) > 0.0:
+                base = aux_loss if aux_loss is not None else (0 * hallucination_loss)
+                aux_loss = base + float(net_charge_weight) * NetChargeLoss(target_max_charge=float(net_charge_target), normalize_by_length=True)
+
+            # Total objective: start from hallucination; add optional aux; add motif terms
             motif_geo = _build_motif_geo_loss()
-            struct = hallucination_loss + aux_loss + motif_geo
+            struct = hallucination_loss + (aux_loss if aux_loss is not None else 0 * hallucination_loss) + motif_geo
 
             # Loss-internal gradient shaping
+            struct = NormedGradient(loss=struct)
             struct = ClippedGradient(loss=struct, max_norm=1.0)
 
             v_struct, aux_struct = struct(probs_masked, output=output, key=key)
 
             # Optional ProteinMPNN prior
             if float(mpnn_weight) > 0.0:
-                mpnn_loss = ProteinMPNNLoss(mpnn=_get_mpnn(), num_samples=4, stop_grad=True)
-                v_mpnn, aux_mpnn = mpnn_loss(probs_masked, output, key)
-                v_struct = v_struct + float(mpnn_weight) * v_mpnn
-                aux_struct = {**aux_struct, "mpnn": aux_mpnn}
+                try:
+                    from mosaic.losses.protein_mpnn import ProteinMPNNLoss as _ProteinMPNNLoss
+                    mpnn_loss = _ProteinMPNNLoss(mpnn=_get_mpnn(), num_samples=4, stop_grad=True)
+                    v_mpnn, aux_mpnn = mpnn_loss(probs_masked, output, key)
+                    v_struct = v_struct + float(mpnn_weight) * v_mpnn
+                    aux_struct = {**aux_struct, "mpnn": aux_mpnn}
+                except Exception:
+                    pass
             if not isinstance(aux_struct, dict):
                 aux_struct = {"components": aux_struct}
 
@@ -662,7 +820,7 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
     phase_anneal_steps = 240
 
     def sched_anneal(g, p):
-        T = max(0.01, 1.0 - (1.0 - 0.01) * (p / max(1, phase_anneal_steps)) ** 2)
+        T = max(float(anneal_min_temp), 1.0 - (1.0 - float(anneal_min_temp)) * (p / max(1, phase_anneal_steps)) ** 2)
         # constant LR scaled by 1/sqrt(L); temperature anneals only
         return {"lr": base_lr * inv_sqrt_L, "temperature": T}
 
@@ -719,7 +877,17 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
         },
         {
             "name": "soft",
-            "build_loss": lambda: build_loss_single(state={}),
+            "build_loss": lambda: build_loss_single(
+                state={},
+                use_leaky_entropy=bool(use_leaky_entropy_soft),
+                surface_nonpolar_weight=float(surface_nonpolar_weight_soft),
+                net_charge_weight=float(net_charge_weight_soft),
+                net_charge_target=float(net_charge_target),
+                snp_n0=float(snp_n0),
+                entropy_beta_local=float(entropy_beta),
+                entropy_max_contact_bin_local=float(entropy_max_contact_bin),
+                include_struct_priors=bool(include_struct_priors_soft),
+            ),
             "optimizer": sgd_logits,
             "steps": phase_warmup_steps,  # default; runner may override
             "schedule": sched_soft,
@@ -733,7 +901,17 @@ def make_workflow(*, binder_len: int, motif_positions: dict, tmol_context: dict,
         },
         {
             "name": "anneal",
-            "build_loss": lambda: build_loss_single(state={}),
+            "build_loss": lambda: build_loss_single(
+                state={},
+                use_leaky_entropy=bool(use_leaky_entropy_anneal),
+                surface_nonpolar_weight=float(surface_nonpolar_weight_anneal),
+                net_charge_weight=float(net_charge_weight_anneal),
+                net_charge_target=float(net_charge_target),
+                snp_n0=float(snp_n0),
+                entropy_beta_local=float(entropy_beta),
+                entropy_max_contact_bin_local=float(entropy_max_contact_bin),
+                include_struct_priors=bool(include_struct_priors_anneal),
+            ),
             "optimizer": sgd_logits,
             "steps": phase_anneal_steps,
             "schedule": sched_anneal,

@@ -52,7 +52,7 @@ def _run_phase(*, phase: dict, x: np.ndarray, key, global_step: int, callbacks):
         trajectory.append(rec)
         return rec
 
-    x, best_x, traj = optimizer(
+    x, best_x, _ = optimizer(
         loss_function=loss_function,
         x=x,
         n_steps=steps,
@@ -66,11 +66,11 @@ def _run_phase(*, phase: dict, x: np.ndarray, key, global_step: int, callbacks):
     # callbacks at end of phase
     for cb in callbacks or []:
         try:
-            cb({"event": "end_phase", "phase": name, "trajectory": traj})
+            cb({"event": "end_phase", "phase": name, "trajectory": trajectory})
         except Exception:
             pass
 
-    return x, best_x, traj
+    return x, best_x, trajectory
 
 
 def _decode_best_sequence(best_x: np.ndarray) -> str:

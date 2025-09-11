@@ -51,6 +51,7 @@ app = modal.App("adaptyv-boltzcraft", image=image)
 
 boltz_cache = modal.Volume.from_name("boltz-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("results-boltzcraft", create_if_missing=True)
+local_src_mount = modal.Mount.from_local_dir("/Users/tudorcotet/Documents/Adaptyv/mosaic_workflows/src", remote_path="/workspace/src")
 
 def _add_paths(workspace: Path):
     sys.path.append(str(workspace / "src"))
@@ -69,7 +70,7 @@ def _default_steps(total: int = 20) -> Dict[str, int]:
     return {"warmup": w, "soft": s, "anneal": a}
 
 
-@app.function(gpu="A10G", timeout=3 * 60 * 60, volumes={"/root/.boltz": boltz_cache, "/results": results_vol}, secrets=[modal.Secret.from_name("github-token")])
+@app.function(gpu="H100", timeout=3 * 60 * 60, volumes={"/root/.boltz": boltz_cache, "/results": results_vol}, mounts=[local_src_mount], secrets=[modal.Secret.from_name("github-token")])
 def run_mhetase(
     *,
     binder_len: int = 20,
@@ -101,10 +102,13 @@ def run_mhetase(
     Path(os.environ["BOLTZ_CACHE"]).mkdir(parents=True, exist_ok=True)
 
 
-    # Ensure baked repo is importable inside the container
+    # Prefer mounted local source (latest edits), fall back to baked repo
+    local_src = Path("/workspace/src")
+    if local_src.exists():
+        sys.path.insert(0, str(local_src))
     repo_src = Path("/repo/src")
-    if str(repo_src) not in sys.path and repo_src.exists():
-        sys.path.insert(0, str(repo_src))
+    if repo_src.exists():
+        sys.path.append(str(repo_src))
     from mosaic_workflows import run_workflow
     from mosaic_workflows.mhetase_scaffold import (
         build_boltz2_predict_fn_mhetase,
@@ -135,13 +139,24 @@ def run_mhetase(
         motif_template_backbone=(np := __import__("numpy")).array(motif_template_backbone, dtype=float) if motif_template_backbone is not None else None,
         # Loss knobs (can be parameterized via CLI later if needed)
         ligand_metric=os.environ.get("LIGAND_METRIC", "iptm"),
-        pae_on=os.environ.get("PAE_ON", "1") not in ("0", "false", "False"),
-        helix_weight=float(os.environ.get("HELIX_WEIGHT", "-0.3")),
+        pae_on=os.environ.get("PAE_ON", "0") not in ("0", "false", "False"),
+        helix_weight=0.0,
+        # Disable structural priors; keep only motif + entropy + solubility in anneal
+        include_struct_priors_soft=True,
+        include_struct_priors_anneal=True,
+        # Stronger solubility priors in anneal
+        surface_nonpolar_weight_soft=0.0,
+        surface_nonpolar_weight_anneal=1.0,
+        net_charge_weight_soft=0.0,
+        net_charge_weight_anneal=0.1,
+        net_charge_target=-5.0,
+        # Less aggressive anneal
+        anneal_min_temp=0.3,
     )
 
-    # Assign steps to phases: motif_lock + soft + anneal 
+    # Assign steps to phases: motif_lock + soft + longer anneal
     ml = max(1, int(0.2 * total_steps))
-    sf = max(1, int(0.4 * total_steps))
+    sf = max(1, int(0.3 * total_steps))
     an = max(1, int(total_steps - (ml + sf)))
     for p in wf["phases"]:
         if p["name"] == "motif_lock":
@@ -167,17 +182,15 @@ def run_mhetase(
     (out_dir / "best_sequence.txt").write_text(str(out.get("best_sequence", "")))
     np.save(out_dir / "best_x.npy", out.get("best_x"))
 
-    # Save trajectory as JSONL (losses and aux per step)
+    # Save raw trajectory: just step and aux (which includes losses)
     traj = out.get("trajectory") or []
     with open(out_dir / "trajectory.jsonl", "w") as f:
         for rec in traj:
-            # include phase name/metrics when available
-            rec_s = {
+            row = {
                 "step": int(rec.get("step", 0)),
-                "metrics": rec.get("metrics", {}),
                 "aux": rec.get("aux", {}),
             }
-            f.write(json.dumps(rec_s, default=lambda o: float(o) if hasattr(o, "item") else None) + "\n")
+            f.write(json.dumps(row, default=lambda o: float(o) if hasattr(o, "item") else None) + "\n")
 
     # Fold final best sequence with ligand using Boltz2 (3 recycle, 200 diffusion) and save coords + PDB
     try:

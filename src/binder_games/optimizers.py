@@ -51,7 +51,10 @@ def _trajectory_call(trajectory_fn, value, aux, x_probs):
     if trajectory_fn is None:
         return None
     try:
-        return trajectory_fn({"loss": float(value), "aux": aux}, x_probs)
+        # Merge loss into a flat aux dict so analyzers can access top-level keys
+        aux_flat = dict(aux) if isinstance(aux, dict) else {"aux": aux}
+        aux_flat["loss"] = float(value)
+        return trajectory_fn(aux_flat, x_probs)
     except Exception:
         return None
 
@@ -127,6 +130,15 @@ def minmax_logits(*, loss_function, x, n_steps, key=None, schedule=None, transfo
             aux.setdefault("y", {})
             aux["x"]["probs"] = np.array(x_probs)
             aux["y"]["probs"] = np.array(y_probs)
+            # Add simple gradient norm summaries for optimization dynamics analyses
+            try:
+                aux["x"]["grad_norm"] = float(np.linalg.norm(np.array(gx)))
+            except Exception:
+                pass
+            try:
+                aux["y"]["grad_norm"] = float(np.linalg.norm(np.array(gy)))
+            except Exception:
+                pass
         except Exception:
             pass
 

@@ -16,6 +16,12 @@ from .analyzers import (
     value_components,
     decode_sequences_xy,
     off_target_weights_summary,
+    probs_entropy_xy,
+    kl_divergence_xy,
+    sequence_hamming_xy,
+    per_position_entropy_xy,
+    composition_charge_hydropathy_xy,
+    grad_norms_xy,
 )
 
 from .validators import (
@@ -54,6 +60,12 @@ __all__ = [
     "value_components",
     "decode_sequences_xy",
     "off_target_weights_summary",
+    "probs_entropy_xy",
+    "kl_divergence_xy",
+    "sequence_hamming_xy",
+    "per_position_entropy_xy",
+    "composition_charge_hydropathy_xy",
+    "grad_norms_xy",
     # validators
     "gap_threshold",
     "worst_case_threshold",
